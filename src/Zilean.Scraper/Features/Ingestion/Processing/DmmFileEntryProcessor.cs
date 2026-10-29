@@ -106,7 +106,20 @@ public partial class DmmFileEntryProcessor(
 
         try
         {
-            var decodedJson = Decompressor.FromEncodedUriComponent(match.Groups[1].Value);
+            var encoded = match.Groups[1].Value;
+            if (encoded.StartsWith("id=", StringComparison.Ordinal))
+            {
+                // DMM format since 2026-09-30: stub page, data in lists/<id>.txt
+                var resolved = await ResolveStoredListAsync(filePath, encoded[3..], cancellationToken);
+                if (resolved is null)
+                {
+                    _logger.LogWarning("DMM list data not found for stub page {FileName}; will retry next sync", filenameOnly);
+                    return [];
+                }
+                encoded = resolved;
+            }
+
+            var decodedJson = Decompressor.FromEncodedUriComponent(encoded);
 
             var utf8Bytes = Encoding.UTF8.GetBytes(decodedJson);
             var span = new ReadOnlySpan<byte>(utf8Bytes);
@@ -142,6 +155,42 @@ public partial class DmmFileEntryProcessor(
             torrents.Clear();
             _torrentsListPool.Return(torrents);
         }
+    }
+
+    private static async Task<string?> ResolveStoredListAsync(string filePath, string id, CancellationToken cancellationToken)
+    {
+        id = id.Trim();
+        if (id.Length == 0 || id.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || id.Contains(".."))
+        {
+            return null;
+        }
+
+        var dir = Path.GetDirectoryName(filePath) ?? ".";
+        string[] candidates =
+        [
+            Path.Combine(dir, "lists", id + ".txt"),
+            Path.Combine(dir, "repo", "lists", id + ".txt"),
+        ];
+
+        foreach (var candidate in candidates)
+        {
+            if (!File.Exists(candidate))
+            {
+                continue;
+            }
+
+            var content = (await File.ReadAllTextAsync(candidate, cancellationToken)).Trim();
+            var inner = HashCollectionMatcher.Match(content);
+            var value = inner.Success ? inner.Groups[1].Value : content;
+            if (value.Length == 0 || value.StartsWith("id=", StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            return value;
+        }
+
+        return null;
     }
 
     private static ExtractedDmmEntry? ParsePageContent(ref Utf8JsonReader reader)
